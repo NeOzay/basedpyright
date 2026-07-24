@@ -14,18 +14,18 @@ we recommend using vscode, as there are project configuration files in the repo 
 
 1. hit `F1` > `Tasks: Run task` > `install dependencies`, or run the following command:
     ```
-    ./pw uv sync
+    ./gg.cmd uv sync
     ```
-    this will install all dependencies required for the project (pyprojectx, uv, node, typescript, etc.). all dependencies are installed locally to `./.venv` and `./node_modules`
+    this will install all dependencies required for the project ([gg](https://github.com/eirikb/gg), uv, node, typescript, etc.). all dependencies are installed locally to `./.venv` and `./node_modules`
 2. press "Yes" when prompted by vscode to use the newly created virtualenv
 
-you can now run any node/npm commands from inside the venv.
+you can now run any node/pnpm commands from inside the venv.
 
 ## Debugging
 
 !!! note
 
-    these instructions assume you are using VSCode/VSCodium. if you are using another editor, npm tasks can be run via the command line with `npm run script-name`. you can view all the available scripts in the root `./package.json`, but VSCode-specific debug configs will be unavailable.
+    these instructions assume you are using VSCode/VSCodium. if you are using another editor, pnpm tasks can be run via the command line with `pnpm run script-name`. you can view all the available scripts in the root `./package.json`, but VSCode-specific debug configs will be unavailable.
 
 ### CLI
 
@@ -33,22 +33,27 @@ To debug pyright, open the root source directory within VS Code. Open the debug 
 
 ### VSCode extension
 
-To debug the VS Code extension, select “Pyright extension” from the debug target menu. Click on the green “run” icon or press F5 to build and launch a second copy of VS Code with the extension. Within the second VS Code instance, open a python source file so the pyright extension is loaded. Return to the first instance of VS Code and select “Pyright extension attach server” from the debug target menu and click the green “run” icon. This will attach the debugger to the process that hosts the type checker. You can now set breakpoints, etc.
+To debug the VS Code extension:
+
+1. Set `basedpyright.importStrategy` to `"useBundled"` in the project you plan to open in the second VS Code instance.
+2. Select “Pyright extension” from the debug target menu.
+3. Click on the green “run” icon or press F5 to build and launch a second copy of VS Code with the extension.
+4. Within the second VS Code instance, open a python source file so the pyright extension is loaded.
 
 To debug the VS Code extension in watch mode, you can do the above, but select “Pyright extension (watch mode)”. When pyright's source is saved, an incremental build will occur, and you can either reload the second VS Code window or relaunch it to start using the updated code. Note that the watcher stays open when debugging stops, so you may need to stop it (or close VS Code) if you want to perform packaging steps without the output potentially being overwritten.
 
 !!! tip "inspecting LSP messages"
 
-    while the VSCode extension is running in this mode, you can run the `npm: lsp-inspect` task to launch the [LSP inspector](https://lsp-devtools.readthedocs.io/en/latest/lsp-devtools/guide/inspect-command.html), which allows you to browse all messages sent between the client and server:
+    Before launching the extension debug config, set `basedpyright.importStrategy` to `"fromEnvironment"` in the project you plan to open. While the VSCode extension is running in this mode, run the `npm: lsp-inspect` task to launch the [LSP inspector](https://lsp-devtools.readthedocs.io/en/latest/lsp-devtools/guide/inspect-command.html), which allows you to browse all messages sent between the client and server:
 
     ![](./lspinspector.svg)
-
-    note that this does not work on windows, see [this issue](https://github.com/swyddfa/lsp-devtools/issues/125). as a workaround you can use [the client](#language-server) instead.
 
 ### Language server
 
 you may want to debug the language server without the VSCode extension, which can be useful when investigating issues that only seem to occur in other editors. you can do this using [LSP-inspector](https://github.com/swyddfa/lsp-devtools)'s client by running the `npm: lsp-client` task or the "LSP client" launch config
 
-!!! note "for windows users"
+## AI Policy
 
-    the npm script will not work if run from VSCode's task runner. use the launch config instead.
+Basedpyright is primarily maintained by one person. I don't mind if AI is used for small changes that are quick to review (provided you actually look at the code you're submitting), but I don't have time to review large AI generated PRs.
+
+AI allows code to be generated at a much faster rate than it can be reviewed, which is a recipe for disaster (and no, using AI to review it is not a solution).

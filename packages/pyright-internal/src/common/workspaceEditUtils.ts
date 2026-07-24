@@ -97,6 +97,18 @@ export function appendToWorkspaceEdit(
     });
 }
 
+export function hasWorkspaceEditChanges(edits: WorkspaceEdit): boolean {
+    if (edits.changes && Object.values(edits.changes).some((changes) => changes.length > 0)) {
+        return true;
+    }
+
+    if (edits.documentChanges?.some((change) => !TextDocumentEdit.is(change) || change.edits.length > 0)) {
+        return true;
+    }
+
+    return false;
+}
+
 export function applyTextEditsToString(
     edits: TextEditAction[],
     lines: TextRangeCollection<TextRange>,
@@ -165,7 +177,6 @@ export function applyDocumentChanges(program: EditableProgram, fileInfo: SourceF
     if (!fileInfo.isOpenByClient) {
         const fileContent = fileInfo.contents;
         program.setFileOpened(fileInfo.uri, 0, fileContent ?? '', {
-            isTracked: fileInfo.isTracked,
             ipythonMode: fileInfo.ipythonMode,
             chainedFileUri: fileInfo.chainedSourceFile?.uri,
         });
@@ -177,7 +188,6 @@ export function applyDocumentChanges(program: EditableProgram, fileInfo: SourceF
     const sourceDoc = TextDocument.create(filePath, 'python', version, fileInfo.contents ?? '');
 
     program.setFileOpened(fileUri, version + 1, TextDocument.applyEdits(sourceDoc, edits), {
-        isTracked: fileInfo.isTracked,
         ipythonMode: fileInfo.ipythonMode,
         chainedFileUri: fileInfo.chainedSourceFile?.uri,
     });

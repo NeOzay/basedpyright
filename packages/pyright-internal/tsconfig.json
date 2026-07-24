@@ -1,7 +1,11 @@
 {
     "extends": "../../tsconfig.json",
     "compilerOptions": {
+        "types": [
+            "@core-js/types/pure"
+        ],
         "outDir": "./out",
+        "rootDir": "../..",
         "paths": {
         },
     },
@@ -16,5 +20,6 @@
         "dist",
         "out",
         "debug.js",
+        "src/tests/lsp/rspack.testserver.config.js",
     ]
 }

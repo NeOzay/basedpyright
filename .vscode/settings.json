@@ -9,7 +9,7 @@
         "editor.codeActionsOnSave": {
             "source.fixAll.eslint": "always",
             "source.organizeImports": "always"
-        },
+        }
     },
     "[yaml]": {
         "editor.defaultFormatter": "esbenp.prettier-vscode",
@@ -19,11 +19,17 @@
         "editor.defaultFormatter": "tamasfe.even-better-toml",
         "editor.formatOnSave": true
     },
-    "[python][markdown]": {
+    "[python]": {
         "editor.defaultFormatter": "charliermarsh.ruff",
         "editor.codeActionsOnSave": {
             "source.organizeImports": "always"
         }
+    },
+    "[markdown]": {
+        "editor.defaultFormatter": "Jota0222.multi-formatter",
+        // need prettier to format markdown and ruff to format python codeblocks inside the markdown files
+        "multiFormatter.formatterList": ["esbenp.prettier-vscode", "charliermarsh.ruff"],
+        "editor.formatOnSave": true
     },
     "editor.codeActionsOnSave": {
         // this is the default, but we disable it explicitly to prevent any user settings from causing imports to get
@@ -63,7 +69,7 @@
     },
     "explorer.compactFolders": false,
     "search.exclude": {
-        "pw": true
+        "gg.cmd": true
     },
     "python.terminal.activateEnvInCurrentTerminal": true,
     "editor.acceptSuggestionOnCommitCharacter": false,
@@ -73,30 +79,28 @@
         "**/pyright-internal/typeshed-fallback/*",
         "**/docstubs/*",
         "**/build/py_latest/upstream/*",
+        "**/mypy_primer/*" //TODO: why is the ** needed? this is a top level directory
     ],
     // even though python.terminal.activateEnvInCurrentTerminal is enabled, we still need to add the venv's script folder to the PATH
     // because vscode's npm tasks do not run with the activated venv
     "terminal.integrated.env.windows": {
-        "PATH": "${workspaceFolder}/.pyprojectx/main;${workspaceFolder}/node_modules/.bin;${workspaceFolder}/.venv/Scripts;${env:PATH}"
+        "PATH": "${workspaceFolder}/gg;${workspaceFolder}/node_modules/.bin;${workspaceFolder}/.venv/Scripts;${env:PATH}"
     },
     "terminal.integrated.env.osx": {
-        "PATH": "${workspaceFolder}/.pyprojectx/main:${workspaceFolder}/node_modules/.bin:${workspaceFolder}/.venv/bin:${env:PATH}"
+        "PATH": "${workspaceFolder}/gg:${workspaceFolder}/node_modules/.bin:${workspaceFolder}/.venv/bin:${env:PATH}"
     },
     "terminal.integrated.env.linux": {
-        "PATH": "${workspaceFolder}/.pyprojectx/main:${workspaceFolder}/node_modules/.bin:${workspaceFolder}/.venv/bin:${env:PATH}"
+        "PATH": "${workspaceFolder}/gg:${workspaceFolder}/node_modules/.bin:${workspaceFolder}/.venv/bin:${env:PATH}"
     },
     "task.problemMatchers.neverPrompt": true,
     "editor.unicodeHighlight.nonBasicASCII": true,
     "ruff.nativeServer": true,
     "js/ts.inlayHints.parameterNames.enabled": "literals",
     "js/ts.inlayHints.enumMemberValues.enabled": true,
-    // this is a hack to make the jest vscode extension use the venv's version of node (from nodejs-wheel),
-    // since it ignores the PATH from terminal.integrated.env. this is not used when debugging tests.
-    // the run config for that is in launch.json (vscode-jest-tests.v2)
-    "jest.jestCommandLine": "\"./.vscode/jest\"",
+    "jest.jestCommandLine": "./gg.cmd pnpm run jest",
+    "jest.useJest30": true,
     "files.readonlyInclude": {
         ".pdm-build/**/*": true,
-        ".pyprojectx/**/*": true,
         ".pytest_cache/**/*": true,
         ".venv/**/*": true,
         "**/dist/**/*": true,
@@ -105,11 +109,9 @@
         "basedpyright/index.js": true,
         "basedpyright/langserver.index.js": true,
         "docstubs/**/*": true,
-        "package-lock.json": true,
+        "pnpm-lock.yaml": true,
         "uv.lock": true,
-        "pw.lock": true,
-        "pw": true,
-        "pw.bat": true
+        "gg.cmd": true,
     },
     // package.json file copied into the pypi package
     // this is a top-level folder but the ** is still needed due to https://github.com/microsoft/vscode/issues/92114
@@ -134,5 +136,10 @@
     "workbench.editor.revealIfOpen": true,
     // https://github.com/microsoft/vscode-python/issues/25467
     "python.terminal.shellIntegration.enabled": false,
-    "zizmor.executablePath": ".vscode/zizmor"
+    // this is a hack to make the zizmor vscode extension use the venv's version of zizmor,
+    // since it ignores the PATH from terminal.integrated.env.
+    "zizmor.executablePath": ".vscode/zizmor",
+    "eslint.useFlatConfig": false,
+    "npm.scriptRunner": "pnpm",
+    "npm.packageManager": "pnpm"
 }

@@ -5,20 +5,24 @@
  *
  * LanguageServer features that can be dynamically added or removed from LSP server
  */
-import { Disposable } from 'vscode-languageserver';
+import { Connection, Disposable, RegistrationType } from 'vscode-languageserver';
 import { ServerSettings } from '../common/languageServerInterface';
 
-export abstract class DynamicFeature {
-    private _lastRegistration: Disposable | undefined;
+export abstract class DynamicFeature<T> {
+    private _lastRegistration: { disposable?: Disposable; key?: string } = {};
+    protected abstract type: RegistrationType<T>;
 
-    constructor(readonly name: string) {
+    constructor(readonly name: string, private readonly _connection: Connection) {
         // Empty
     }
 
     register() {
-        this.registerFeature().then((d) => {
+        this._registerFeature().then((d) => {
+            if (!d) {
+                return;
+            }
             this.dispose();
-            this._lastRegistration = d;
+            this._lastRegistration.disposable = d;
         });
     }
 
@@ -26,18 +30,36 @@ export abstract class DynamicFeature {
         // Default is no-op
     }
 
+    /** Unregister the current registration. Called internally by register() to clean up before re-registering. */
     dispose() {
-        this._lastRegistration?.dispose();
-        this._lastRegistration = undefined;
+        this._lastRegistration.disposable?.dispose();
+        this._lastRegistration = {};
     }
 
-    protected abstract registerFeature(): Promise<Disposable>;
+    /** Fully disable this feature so it can be re-enabled on the next update(). */
+    disable() {
+        this.dispose();
+    }
+
+    /**
+     * create the options for the feature to be registered, along with a `key` which is used to identify and prevent duplicate re-registrations
+     */
+    protected abstract featureOptions(): { options: T; key: string };
+
+    private async _registerFeature() {
+        const { options, key } = this.featureOptions();
+        if (key !== this._lastRegistration.key) {
+            this._lastRegistration.key = key;
+            return this._connection.client.register(this.type, options);
+        }
+        return undefined;
+    }
 }
 
 export class DynamicFeatures {
-    private readonly _map = new Map<string, DynamicFeature>();
+    private readonly _map = new Map<string, DynamicFeature<unknown>>();
 
-    add(feature: DynamicFeature) {
+    add(feature: DynamicFeature<unknown>) {
         const old = this._map.get(feature.name);
         if (old) {
             old.dispose();

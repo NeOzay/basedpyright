@@ -43,6 +43,7 @@ import { Token } from '../parser/tokenizerTypes';
 import { AnalyzerFileInfo, ImportLookup } from './analyzerFileInfo';
 import * as AnalyzerNodeInfo from './analyzerNodeInfo';
 import { Binder } from './binder';
+import { CellChainIndexProvider } from './cellChainIndex';
 import { Checker } from './checker';
 import { CircularDependency } from './circularDependency';
 import * as CommentUtils from './commentUtils';
@@ -188,6 +189,7 @@ class WriteableData {
     // above information. This needs to be recomputed any time the
     // above change.
     accumulatedDiagnostics: Diagnostic[] = [];
+    diagnosticsWithoutFileIgnore: Diagnostic[] = [];
 
     // Circular dependencies that have been reported in this file.
     circularDependencies: CircularDependency[] = [];
@@ -447,6 +449,10 @@ export class SourceFile {
         }
 
         return this._writableData.accumulatedDiagnostics;
+    }
+
+    getDiagnosticsWithoutFileIgnore(): Diagnostic[] {
+        return this._writableData.diagnosticsWithoutFileIgnore;
     }
 
     getImports(): ImportResult[] {
@@ -840,7 +846,7 @@ export class SourceFile {
                     this._writableData.taskListDiagnostics = [];
                     this._addTaskListDiagnostics(
                         configOptions.taskListTokens,
-                        parseFileResults.tokenizerOutput,
+                        parseFileResults,
                         this._writableData.taskListDiagnostics
                     );
                 });
@@ -942,7 +948,8 @@ export class SourceFile {
         configOptions: ConfigOptions,
         importLookup: ImportLookup,
         builtinsScope: Scope | undefined,
-        futureImports: Set<string>
+        futureImports: Set<string>,
+        cellChainIndex: CellChainIndexProvider | undefined
     ) {
         assert(!this.isParseRequired(), 'Bind called before parsing');
         assert(this.isBindingRequired(), 'Bind called unnecessarily');
@@ -958,7 +965,7 @@ export class SourceFile {
                     const fileInfo = this._buildFileInfo(configOptions, importLookup, builtinsScope, futureImports);
                     AnalyzerNodeInfo.setFileInfo(this._writableData.parserOutput!.parseTree, fileInfo);
 
-                    const binder = new Binder(fileInfo, configOptions.indexGenerationMode);
+                    const binder = new Binder(fileInfo, configOptions.indexGenerationMode, cellChainIndex);
                     this._writableData.isBindingInProgress = true;
                     binder.bindModule(this._writableData.parserOutput!.parseTree);
 
@@ -1397,6 +1404,11 @@ export class SourceFile {
             diagList = diagList.filter((diag) => diag.category === DiagnosticCategory.Hint);
         }
 
+        // Capture the fully-filtered diagnostics before any file-level ignore clears them, so
+        // consumers that need the unsuppressed list (e.g. ignored-file quick fixes) can access it.
+        // For non-ignored files this is the same array reference as accumulatedDiagnostics below.
+        this._writableData.diagnosticsWithoutFileIgnore = diagList;
+
         // If the file is in the ignore list, clear the diagnostic list.
         if (configOptions.ignore.find((ignoreFileSpec) => this._uri.matchesRegex(ignoreFileSpec.regExp))) {
             diagList = [];
@@ -1422,12 +1434,15 @@ export class SourceFile {
     // to the specified diagnostic list.
     private _addTaskListDiagnostics(
         taskListTokens: TaskListToken[] | undefined,
-        tokenizerOutput: TokenizerOutput,
+        parseFileResults: ParseFileResults,
         diagList: Diagnostic[]
     ) {
         if (!taskListTokens || taskListTokens.length === 0 || !diagList) {
             return;
         }
+
+        const tokenizerOutput = parseFileResults.tokenizerOutput;
+        const fileContents = parseFileResults.text;
 
         for (let i = 0; i < tokenizerOutput.tokens.count; i++) {
             const token = tokenizerOutput.tokens.getItemAt(i);
@@ -1438,36 +1453,65 @@ export class SourceFile {
             }
 
             for (const comment of token.comments) {
-                for (const token of taskListTokens) {
-                    // Check if the comment matches the task list token.
-                    // The comment must start with zero or more whitespace characters,
-                    // followed by the taskListToken (case insensitive),
-                    // followed by (0+ whitespace + EOL) OR (1+ NON-alphanumeric characters)
-                    const regexStr = '^[\\s]*' + token.text + '([\\s]*$|[\\W]+)';
-                    const regex = RegExp(regexStr, 'i'); // case insensitive
+                for (const taskToken of taskListTokens) {
+                    // Match: optional leading whitespace, then taskToken.text (case-insensitive),
+                    // then either (whitespace to end) or (non-alphanumeric char).
+                    const commentStart = comment.start;
+                    const commentEnd = commentStart + comment.length;
+                    const taskText = taskToken.text;
+                    const taskLen = taskText.length;
 
-                    // If the comment doesn't match, skip it.
-                    if (!regex.test(comment.value)) {
+                    // Skip leading whitespace within the source text range.
+                    let pos = commentStart;
+                    while (pos < commentEnd) {
+                        const ch = fileContents.charCodeAt(pos);
+                        if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d || ch === 0x0c || ch === 0x0b) {
+                            pos++;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Check if the task token text matches (case-insensitive).
+                    if (pos + taskLen > commentEnd) {
                         continue;
                     }
 
-                    // Calculate the range for the diagnostic. This allows navigation
-                    // to the comment via double clicking the item in the task list pane.
-                    let rangeStart = comment.start;
+                    let matched = true;
+                    for (let k = 0; k < taskLen; k++) {
+                        const a = fileContents.charCodeAt(pos + k);
+                        const b = taskText.charCodeAt(k);
+                        if (a !== b && (a | 0x20) !== (b | 0x20)) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if (!matched) {
+                        continue;
+                    }
 
-                    // The comment technically starts right after the comment identifier(#),
-                    // but we want the caret right before the task list token (since there
-                    // might be whitespace before it).
-                    const indexOfToken = comment.value.toLowerCase().indexOf(token.text.toLowerCase());
-                    rangeStart += indexOfToken;
+                    // After the token, require whitespace-to-end or a non-word character.
+                    const afterPos = pos + taskLen;
+                    if (afterPos < commentEnd) {
+                        const ch = fileContents.charCodeAt(afterPos);
+                        // Check if ch is a word character [a-zA-Z0-9_]
+                        const isWord =
+                            (ch >= 0x61 && ch <= 0x7a) ||
+                            (ch >= 0x41 && ch <= 0x5a) ||
+                            (ch >= 0x30 && ch <= 0x39) ||
+                            ch === 0x5f;
+                        if (isWord) {
+                            continue;
+                        }
+                    }
 
+                    // Match succeeded. pos is the offset of the task token in the source text.
                     const rangeEnd = TextRange.getEnd(comment);
-                    const range = convertOffsetsToRange(rangeStart, rangeEnd, tokenizerOutput.lines!);
+                    const range = convertOffsetsToRange(pos, rangeEnd, tokenizerOutput.lines!);
 
-                    // Add the diagnostic to the list and trim whitespace from the comment so
-                    // it's easier to read in the task list.
+                    const commentValue = comment.value;
                     diagList.push(
-                        new Diagnostic(DiagnosticCategory.TaskItem, comment.value.trim(), range, token.priority)
+                        new Diagnostic(DiagnosticCategory.TaskItem, commentValue.trim(), range, taskToken.priority)
                     );
                 }
             }

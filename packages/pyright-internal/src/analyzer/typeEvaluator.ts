@@ -213,6 +213,7 @@ import {
     DeclaredSymbolTypeInfo,
     EffectiveTypeResult,
     EvalFlags,
+    ensureExpectedTypeCandidates,
     EvaluatorUsage,
     ExpectedTypeOptions,
     ExpectedTypeResult,
@@ -638,6 +639,11 @@ interface SuppressedNodeStackEntry {
     suppressedDiags: string[] | undefined;
 }
 
+interface ExpectedTypeCacheEntry {
+    type: Type;
+    candidates: Type[];
+}
+
 export function createTypeEvaluator(
     importLookup: ImportLookup,
     evaluatorOptions: EvaluatorOptions,
@@ -652,7 +658,7 @@ export function createTypeEvaluator(
     let codeFlowAnalyzerCache = new Map<number, CodeFlowAnalyzerCacheEntry[]>();
     let typeCache = new Map<number, TypeCacheEntry>();
     let effectiveTypeCache = new Map<number, Map<string, EffectiveTypeResult>>();
-    let expectedTypeCache = new Map<number, Type>();
+    let expectedTypeCache = new Map<number, ExpectedTypeCacheEntry>();
     let asymmetricAccessorAssignmentCache = new Set<number>();
     let deferredClassCompletions: DeferredClassCompletion[] = [];
     let cancellationToken: CancellationToken | undefined;
@@ -708,7 +714,7 @@ export function createTypeEvaluator(
         codeFlowAnalyzerCache = new Map<number, CodeFlowAnalyzerCacheEntry[]>();
         typeCache = new Map<number, TypeCacheEntry>();
         effectiveTypeCache = new Map<number, Map<string, EffectiveTypeResult>>();
-        expectedTypeCache = new Map<number, Type>();
+        expectedTypeCache = new Map<number, ExpectedTypeCacheEntry>();
         asymmetricAccessorAssignmentCache = new Set<number>();
     }
 
@@ -874,8 +880,13 @@ export function createTypeEvaluator(
     }
 
     function popSymbolResolution(symbol: Symbol) {
-        const poppedEntry = symbolResolutionStack.pop()!;
-        assert(poppedEntry.symbolId === symbol.id);
+        const poppedEntry = symbolResolutionStack.pop();
+        assert(
+            poppedEntry !== undefined && poppedEntry.symbolId === symbol.id,
+            `Symbol resolution stack mismatch: expected symbol ${symbol.id}, got ${
+                poppedEntry?.symbolId ?? 'empty stack'
+            }`
+        );
         return poppedEntry.isResultValid;
     }
 
@@ -1000,8 +1011,9 @@ export function createTypeEvaluator(
             const expectedType = expectedTypeCache.get(curNode.id);
             if (expectedType) {
                 return {
-                    type: expectedType,
+                    type: expectedType.type,
                     node: curNode,
+                    candidates: ensureExpectedTypeCandidates(expectedType.type, expectedType.candidates),
                 };
             }
 
@@ -1013,6 +1025,22 @@ export function createTypeEvaluator(
         }
 
         return undefined;
+    }
+
+    function addExpectedTypeCacheEntry(node: ParseNode, expectedType: Type) {
+        const cached = expectedTypeCache.get(node.id);
+        if (!cached) {
+            expectedTypeCache.set(node.id, {
+                type: expectedType,
+                candidates: [expectedType],
+            });
+            return;
+        }
+
+        cached.type = expectedType;
+        if (!cached.candidates.some((candidate) => isTypeSame(candidate, expectedType))) {
+            cached.candidates.push(expectedType);
+        }
     }
 
     function initializePrefetchedTypes(node: ParseNode) {
@@ -1201,7 +1229,7 @@ export function createTypeEvaluator(
             !isAnyOrUnknown(inferenceContext.expectedType) &&
             !isNever(inferenceContext.expectedType)
         ) {
-            expectedTypeCache.set(node.id, inferenceContext.expectedType);
+            addExpectedTypeCacheEntry(node, inferenceContext.expectedType);
 
             if (!typeResult.isIncomplete && !typeResult.expectedTypeDiagAddendum) {
                 const diag = new DiagnosticAddendum();
@@ -2729,21 +2757,49 @@ export function createTypeEvaluator(
 
         function addOneFunctionToSignature(type: FunctionType) {
             let callResult: CallResult | undefined;
+            const constraints = new ConstraintTracker();
 
             useSpeculativeMode(callNode, () => {
                 callResult = validateArgs(
                     exprNode,
                     argList,
                     { type },
-                    /* constraints */ undefined,
+                    constraints,
                     /* skipUnknownArgCheck */ true,
                     /* inferenceContext */ undefined
                 );
             });
 
+            const specializedType = solveAndApplyConstraints(type, constraints);
+            const finalType = isFunction(specializedType) ? specializedType : type;
+            const hasActiveArg = argList.some((arg) => arg.active);
+
+            // If the type was specialized (e.g. ParamSpec expansion), the activeParam
+            // from the original validateArgs refers to parameters in the unspecialized
+            // type and won't match the specialized type's parameters. Re-run validateArgs
+            // against the specialized type to get the correct activeParam mapping.
+            let activeParam = callResult?.activeParam;
+            if (hasActiveArg && finalType !== type) {
+                let specializedActiveParam: typeof activeParam | undefined;
+                useSpeculativeMode(callNode, () => {
+                    const specializedResult = validateArgs(
+                        exprNode,
+                        argList,
+                        { type: finalType },
+                        new ConstraintTracker(),
+                        /* skipUnknownArgCheck */ true,
+                        /* inferenceContext */ undefined
+                    );
+                    specializedActiveParam = specializedResult?.activeParam;
+                });
+                if (specializedActiveParam) {
+                    activeParam = specializedActiveParam;
+                }
+            }
+
             signatures.push({
-                type: expandTypedKwargs(type),
-                activeParam: callResult?.activeParam,
+                type: expandTypedKwargs(finalType),
+                activeParam,
             });
         }
 
@@ -2846,14 +2902,24 @@ export function createTypeEvaluator(
         }
 
         tdEntries.forEach((tdEntry, name) => {
+            // A TypedDict entry type may carry the TypedDict's own type parameters (e.g. an unpacked
+            // generic TypedDict `**kwargs: Unpack[TD[int]]`), so specialize each entry against the
+            // (possibly generic) TypedDict instance. Specializing an already-concrete type is a
+            // no-op, so this is safe for non-generic TypedDicts.
+            const specializedValueType = partiallySpecializeType(
+                tdEntry.valueType,
+                kwargsType,
+                /* typeClassType */ undefined
+            );
+
             FunctionType.addParam(
                 newFunction,
                 FunctionParam.create(
                     ParamCategory.Simple,
-                    tdEntry.valueType,
+                    specializedValueType,
                     FunctionParamFlags.TypeDeclared,
                     name,
-                    tdEntry.isRequired ? undefined : tdEntry.valueType
+                    tdEntry.isRequired ? undefined : specializedValueType
                 )
             );
         });
@@ -2861,11 +2927,20 @@ export function createTypeEvaluator(
         const extraItemsType = kwargsType.shared.typedDictEntries?.extraItems?.valueType;
 
         if (extraItemsType && !isNever(extraItemsType)) {
+            // Specialized for the same reason as the per-entry types above. This PEP 728
+            // `extra_items` branch uses the identical mechanism and is intentionally not
+            // separately tested.
+            const specializedExtraItemsType = partiallySpecializeType(
+                extraItemsType,
+                kwargsType,
+                /* typeClassType */ undefined
+            );
+
             FunctionType.addParam(
                 newFunction,
                 FunctionParam.create(
                     ParamCategory.KwargsDict,
-                    extraItemsType,
+                    specializedExtraItemsType,
                     FunctionParamFlags.TypeDeclared,
                     'kwargs'
                 )
@@ -10758,11 +10833,13 @@ export function createTypeEvaluator(
                 return { returnType: createNewType(errorNode, argList) };
             }
 
-            // Handle the Sentinel call specially.
-            if (className === 'Sentinel') {
-                if (AnalyzerNodeInfo.getFileInfo(errorNode).diagnosticRuleSet.enableExperimentalFeatures) {
-                    return { returnType: createSentinelType(evaluatorInterface, errorNode, argList) };
-                }
+            // Handle sentinel calls specially.
+            if (
+                expandedCallType.shared.fullName === 'builtins.sentinel' ||
+                expandedCallType.shared.fullName === 'typing_extensions.sentinel' ||
+                expandedCallType.shared.fullName === 'typing_extensions.Sentinel'
+            ) {
+                return { returnType: createSentinelType(evaluatorInterface, errorNode, argList) };
             }
 
             if (ClassType.isSpecialFormClass(expandedCallType)) {
@@ -14288,7 +14365,18 @@ export function createTypeEvaluator(
             }
         }
 
-        const result = getTypeOfDictionaryInferred(node, flags, /* hasExpectedType */ !!inferenceContext?.expectedType);
+        // Don't force strict inference when the expected type is a TypeVar that
+        // couldn't constrain the dict's key/value structure. A TypeVar like _T
+        // from sorted(Iterable[_T], key=...) doesn't provide useful type
+        // information for dict inference, and forcing strict inference would
+        // widen heterogeneous value types into a union that can cause false
+        // positives (e.g., dict[str, Path | str | dict[Any, Any]] when the
+        // user meant each key to have a specific type).
+        // Note: bounded/constrained TypeVars with dict-like bounds are handled
+        // by getTypeOfDictionaryWithContext above (via makeTopLevelTypeVarsConcrete),
+        // so they don't reach this fallback.
+        const hasUsefulExpectedType = !!inferenceContext?.expectedType && !isTypeVar(inferenceContext.expectedType);
+        const result = getTypeOfDictionaryInferred(node, flags, /* hasExpectedType */ hasUsefulExpectedType);
         return { ...result, expectedTypeDiagAddendum };
     }
 
@@ -20062,6 +20150,14 @@ export function createTypeEvaluator(
                                         // Do not retain TypeForm types in inferred return types.
                                         returnType = stripTypeForm(returnType);
 
+                                        // If we're returning a function value (or overload), force
+                                        // lazy return-type inference before caching this function's
+                                        // inferred return. Without this, a partially evaluated
+                                        // function can leak a temporary Any return type (for example,
+                                        // immediately after an edit), and that Any then gets cached
+                                        // as though it were final for the enclosing function.
+                                        inferReturnTypeIfNecessary(returnType);
+
                                         inferredReturnTypes.push(returnType);
                                     } else {
                                         inferredReturnTypes.push(getNoneType());
@@ -21138,6 +21234,11 @@ export function createTypeEvaluator(
                 evaluateTypesForAssignmentStatement(parent);
                 return;
             }
+
+            case ParseNodeType.AugmentedAssignment: {
+                evaluateTypesForAugmentedAssignment(parent);
+                return;
+            }
         }
 
         if (nodeToEvaluate.nodeType === ParseNodeType.TypeAnnotation) {
@@ -22209,7 +22310,10 @@ export function createTypeEvaluator(
         const scopeNodeInfo = ParseTreeUtils.getEvaluationScopeNode(node);
         const scope = AnalyzerNodeInfo.getScope(scopeNodeInfo.node);
 
-        let symbolWithScope = scope?.lookUpSymbolRecursive(name, { useProxyScope: !!scopeNodeInfo.useProxyScope });
+        let symbolWithScope = scope?.lookUpSymbolRecursive(name, {
+            useProxyScope: !!scopeNodeInfo.useProxyScope,
+            useChainedModuleLevelScopes: !!scopeNodeInfo.useChainedModuleLevelScopes,
+        });
         const scopeType = scope?.type ?? ScopeType.Module;
 
         // Functions and list comprehensions don't allow access to implicitly
@@ -22492,6 +22596,56 @@ export function createTypeEvaluator(
         return undefined;
     }
 
+    function _shouldFallBackToClassEntryForKeywordArg(baseType: ClassType, paramName: string) {
+        return (
+            ClassType.isDataClass(baseType) ||
+            ClassType.isTypedDictClass(baseType) ||
+            ClassType.hasNamedTupleEntry(baseType, paramName)
+        );
+    }
+
+    function _addSymbolDeclInfo(
+        symbol: Symbol,
+        decls: Declaration[],
+        synthesizedTypes: SynthesizedTypeInfo[],
+        preferTypedDeclarations = false
+    ) {
+        const declCountBeforeAdd = decls.length;
+        const typedDecls = preferTypedDeclarations ? symbol.getTypedDeclarations() : undefined;
+        appendArray(decls, typedDecls?.length ? typedDecls : symbol.getDeclarations());
+
+        const synthTypeInfo = symbol.getSynthesizedType();
+        if (synthTypeInfo) {
+            synthesizedTypes.push(synthTypeInfo);
+
+            // Some module members are represented only by a synthesized module type,
+            // with no concrete declaration node to navigate to. Synthesize a matching
+            // alias declaration so definition/declaration/reference features can still
+            // bind to the submodule's file.
+            if (
+                decls.length === declCountBeforeAdd &&
+                isModule(synthTypeInfo.type) &&
+                !synthTypeInfo.type.priv.fileUri.isEmpty()
+            ) {
+                decls.push(synthesizeAliasDeclaration(synthTypeInfo.type.priv.fileUri));
+            }
+        }
+    }
+
+    function _addClassEntryDeclsForKeywordArgIfPresent(
+        baseType: ClassType,
+        paramName: string,
+        decls: Declaration[],
+        synthesizedTypes: SynthesizedTypeInfo[]
+    ) {
+        const lookupResults = lookUpClassMember(baseType, paramName);
+        if (!lookupResults) {
+            return;
+        }
+
+        _addSymbolDeclInfo(lookupResults.symbol, decls, synthesizedTypes);
+    }
+
     // In general, string nodes don't have any declarations associated with them, but
     // we need to handle the special case of string literals used as keys within a
     // dictionary expression where those keys are associated with a known TypedDict.
@@ -22512,12 +22666,7 @@ export function createTypeEvaluator(
                         const symbol = lookUpObjectMember(subtype, node.d.value)?.symbol;
 
                         if (symbol) {
-                            appendArray(decls, symbol.getDeclarations());
-
-                            const synthTypeInfo = symbol.getSynthesizedType();
-                            if (synthTypeInfo) {
-                                synthesizedTypes.push(synthTypeInfo);
-                            }
+                            _addSymbolDeclInfo(symbol, decls, synthesizedTypes);
                         }
                     }
                 }
@@ -22616,17 +22765,7 @@ export function createTypeEvaluator(
                         // By default, report only the declarations that have type annotations.
                         // If there are none, then report all of the unannotated declarations,
                         // which includes every assignment of that symbol.
-                        const typedDecls = symbol.getTypedDeclarations();
-                        if (typedDecls.length > 0) {
-                            appendArray(decls, typedDecls);
-                        } else {
-                            appendArray(decls, symbol.getDeclarations());
-                        }
-
-                        const synthTypeInfo = symbol.getSynthesizedType();
-                        if (synthTypeInfo) {
-                            synthesizedTypes.push(synthTypeInfo);
-                        }
+                        _addSymbolDeclInfo(symbol, decls, synthesizedTypes, /* preferTypedDeclarations */ true);
                     }
                 });
             }
@@ -22680,41 +22819,15 @@ export function createTypeEvaluator(
                             const paramDecl = getDeclarationFromKeywordParam(initMethodType, paramName);
                             if (paramDecl) {
                                 decls.push(paramDecl);
-                            } else if (
-                                ClassType.isDataClass(baseType) ||
-                                ClassType.isTypedDictClass(baseType) ||
-                                ClassType.hasNamedTupleEntry(baseType, paramName)
-                            ) {
-                                const lookupResults = lookUpClassMember(baseType, paramName);
-
-                                if (lookupResults) {
-                                    appendArray(decls, lookupResults.symbol.getDeclarations());
-
-                                    const synthTypeInfo = lookupResults.symbol.getSynthesizedType();
-                                    if (synthTypeInfo) {
-                                        synthesizedTypes.push(synthTypeInfo);
-                                    }
-                                }
+                            } else if (_shouldFallBackToClassEntryForKeywordArg(baseType, paramName)) {
+                                _addClassEntryDeclsForKeywordArgIfPresent(baseType, paramName, decls, synthesizedTypes);
                             }
-                        } else if (
-                            ClassType.isDataClass(baseType) ||
-                            ClassType.isTypedDictClass(baseType) ||
-                            ClassType.hasNamedTupleEntry(baseType, paramName)
-                        ) {
+                        } else if (_shouldFallBackToClassEntryForKeywordArg(baseType, paramName)) {
                             // Some synthesized callables (notably TypedDict "constructors") don't have a
                             // meaningful __init__ signature we can map keyword arguments to. In these cases,
                             // treat the keyword as referring to the class entry so IDE features like
                             // go-to-definition and rename can bind to the field declaration.
-                            const lookupResults = lookUpClassMember(baseType, paramName);
-
-                            if (lookupResults) {
-                                appendArray(decls, lookupResults.symbol.getDeclarations());
-
-                                const synthTypeInfo = lookupResults.symbol.getSynthesizedType();
-                                if (synthTypeInfo) {
-                                    synthesizedTypes.push(synthTypeInfo);
-                                }
-                            }
+                            _addClassEntryDeclsForKeywordArgIfPresent(baseType, paramName, decls, synthesizedTypes);
                         }
                     }
                 }
@@ -22748,12 +22861,7 @@ export function createTypeEvaluator(
             );
 
             if (symbolWithScope) {
-                appendArray(decls, symbolWithScope.symbol.getDeclarations());
-
-                const synthTypeInfo = symbolWithScope.symbol.getSynthesizedType();
-                if (synthTypeInfo) {
-                    synthesizedTypes.push(synthTypeInfo);
-                }
+                _addSymbolDeclInfo(symbolWithScope.symbol, decls, synthesizedTypes);
             }
         }
 
@@ -23711,12 +23819,14 @@ export function createTypeEvaluator(
 
         decls.forEach((decl) => {
             if (pushSymbolResolution(symbol, decl)) {
+                let symbolPopped = false;
                 try {
                     let type = getInferredTypeOfDeclaration(symbol, decl);
 
                     if (!popSymbolResolution(symbol)) {
                         isIncomplete = true;
                     }
+                    symbolPopped = true;
 
                     if (type) {
                         if (decl.type === DeclarationType.Variable) {
@@ -23754,8 +23864,10 @@ export function createTypeEvaluator(
                         isIncomplete = true;
                     }
                 } catch (e: any) {
-                    // Clean up the stack before rethrowing.
-                    popSymbolResolution(symbol);
+                    // Clean up the stack before rethrowing, but only if we haven't already popped.
+                    if (!symbolPopped) {
+                        popSymbolResolution(symbol);
+                    }
                     throw e;
                 }
             } else {
@@ -27196,9 +27308,9 @@ export function createTypeEvaluator(
                 ).length;
 
                 diag?.createAddendum().addMessage(
-                    LocAddendum.functionTooFewParams().format({
-                        expected: nonDefaultSrcParamCount,
-                        received: destPositionalCount,
+                    LocAddendum.functionTooManyParams().format({
+                        expected: destPositionalCount,
+                        received: nonDefaultSrcParamCount,
                     })
                 );
                 canAssign = false;
@@ -27269,9 +27381,9 @@ export function createTypeEvaluator(
 
                 if (srcPositionalCount < adjDestPositionalCount) {
                     diag?.addMessage(
-                        LocAddendum.functionTooManyParams().format({
-                            expected: srcPositionalCount,
-                            received: destPositionalCount,
+                        LocAddendum.functionTooFewParams().format({
+                            expected: adjDestPositionalCount,
+                            received: srcPositionalCount,
                         })
                     );
                     canAssign = false;
@@ -28091,19 +28203,32 @@ export function createTypeEvaluator(
                     }
                 }
             } else if (overrideParamDetails.positionParamCount > baseParamDetails.positionParamCount) {
-                // Verify that all of the override parameters that extend the
-                // signature are either *args, **kwargs or parameters with
-                // default values.
+                const isCallableAttrOverriddenByInstanceMethod =
+                    baseParamDetails.positionParamCount === 0 &&
+                    overrideParamDetails.positionParamCount === 1 &&
+                    FunctionType.isInstanceMethod(overrideMethod) &&
+                    !FunctionType.isStaticMethod(baseMethod) &&
+                    !FunctionType.isClassMethod(baseMethod);
 
-                for (let i = baseParamDetails.positionParamCount; i < overrideParamDetails.positionParamCount; i++) {
-                    const overrideParam = overrideParamDetails.params[i].param;
+                if (!isCallableAttrOverriddenByInstanceMethod) {
+                    // Verify that all of the override parameters that extend the
+                    // signature are either *args, **kwargs or parameters with
+                    // default values.
 
-                    if (
-                        overrideParam.category === ParamCategory.Simple &&
-                        overrideParam.name &&
-                        !overrideParamDetails.params[i].defaultType
+                    for (
+                        let i = baseParamDetails.positionParamCount;
+                        i < overrideParamDetails.positionParamCount;
+                        i++
                     ) {
-                        foundParamCountMismatch = true;
+                        const overrideParam = overrideParamDetails.params[i].param;
+
+                        if (
+                            overrideParam.category === ParamCategory.Simple &&
+                            overrideParam.name &&
+                            !overrideParamDetails.params[i].defaultType
+                        ) {
+                            foundParamCountMismatch = true;
+                        }
                     }
                 }
             }
@@ -29011,8 +29136,11 @@ export function createTypeEvaluator(
         if (options?.useFullyQualifiedNames) {
             flags |= TypePrinter.PrintTypeFlags.UseFullyQualifiedNames;
         }
-        const result = TypePrinter.printType(type, flags, getEffectiveReturnType, options?.importTracker);
-        return result;
+        if (options?.disablePep604) {
+            flags &= ~TypePrinter.PrintTypeFlags.PEP604;
+        }
+
+        return TypePrinter.printType(type, flags, getEffectiveReturnType, options?.importTracker);
     }
 
     // Calls back into the parser to parse the contents of a string literal.
